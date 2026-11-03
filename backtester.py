@@ -1,111 +1,155 @@
-"""
-Walk-forward strategy tester (uses backtester.py in the same folder).
+from __future__ import annotations
 
-For each window:
-  1. Grid-search strategy parameters on the TRAIN slice (maximize Sharpe).
-  2. Apply the best parameters to the next TEST slice, which the optimizer never saw.
-Stitch all TEST slices together -> an out-of-sample equity curve.
+from typing import Callable
 
-If the out-of-sample result is much worse than the in-sample result,
-the strategy is probably overfit.
-
-Usage:
-    python test_strategy.py --ticker AAPL --start 2010-01-01
-    python test_strategy.py --synthetic --no-plot
-"""
-
-import argparse
-import itertools
 import numpy as np
 import pandas as pd
 
-from backtester import (backtest, sma_crossover, load_prices,
-                        synthetic_prices, summarize, max_drawdown)
-
-PARAM_GRID = {
-    "fast": [5, 10, 20, 30, 50],
-    "slow": [50, 100, 150, 200],
-}
+Strategy = Callable[[pd.Series], pd.Series]
 
 
-def sharpe(r, periods=252):
-    sd = r.std()
-    return np.nan if sd == 0 or np.isnan(sd) else r.mean() / sd * np.sqrt(periods)
+def sma_crossover(prices: pd.Series, fast: int = 20, slow: int = 100) -> pd.Series:
+    if (isinstance(fast, bool) or isinstance(slow, bool)
+            or not isinstance(fast, (int, np.integer))
+            or not isinstance(slow, (int, np.integer))
+            or fast <= 0 or slow <= 0 or fast >= slow):
+        raise ValueError("fast and slow must be positive integers (fast < slow)")
+    fast_avg = prices.rolling(fast, min_periods=fast).mean()
+    slow_avg = prices.rolling(slow, min_periods=slow).mean()
+    return (fast_avg > slow_avg).astype(float)
 
 
-def grid(param_grid):
-    keys = list(param_grid)
-    for combo in itertools.product(*param_grid.values()):
-        p = dict(zip(keys, combo))
-        if "fast" in p and "slow" in p and p["fast"] >= p["slow"]:
-            continue
-        yield p
+def backtest(prices: pd.Series, strategy: Strategy = sma_crossover,
+             cost_bps: float = 5.0, **strategy_params) -> pd.DataFrame:
+    if not isinstance(prices, pd.Series):
+        raise TypeError("prices must be a pandas Series")
+    if prices.empty or not prices.index.is_monotonic_increasing or prices.index.has_duplicates:
+        raise ValueError("prices must be non-empty, date-ordered, and have a unique index")
+    try:
+        prices = pd.to_numeric(prices, errors="raise").astype(float)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("prices must be numeric") from exc
+    if not np.isfinite(prices.to_numpy()).all() or (prices <= 0).any():
+        raise ValueError("prices must contain only finite, positive values")
+    if not np.isfinite(cost_bps) or not 0 <= cost_bps <= 10_000:
+        raise ValueError("cost_bps must be finite and between 0 and 10,000")
+
+    asset_ret = prices.pct_change().fillna(0.0)
+    signal = strategy(prices, **strategy_params)
+    if not isinstance(signal, pd.Series):
+        raise TypeError("strategy must return a pandas Series")
+    if signal.index.has_duplicates:
+        raise ValueError("strategy signal index must be unique")
+    signal = signal.reindex(prices.index)
+    if (signal.isna().any() or not np.isfinite(signal.to_numpy(dtype=float)).all()
+            or not signal.isin([0, 1]).all()):
+        raise ValueError("strategy must return a date-aligned 0/1 position series")
+    position = signal.shift(1).fillna(0.0)
+    turnover = position.diff().abs().fillna(position.abs())
+    costs = turnover * cost_bps / 10_000
+    strat_ret = (1 + position * asset_ret) * (1 - costs) - 1
+    return pd.DataFrame({
+        "price": prices,
+        "signal": signal,
+        "position": position,
+        "asset_ret": asset_ret,
+        "turnover": turnover,
+        "cost": costs,
+        "strat_ret": strat_ret,
+        "equity": (1 + strat_ret).cumprod(),
+    }, index=prices.index)
 
 
-def optimize(train, strategy, param_grid, cost_bps):
-    best, best_score = None, -np.inf
-    for p in grid(param_grid):
-        res = backtest(train, strategy, cost_bps=cost_bps, **p)
-        s = sharpe(res["strat_ret"])
-        if not np.isnan(s) and s > best_score:
-            best, best_score = p, s
-    return best, best_score
+def load_prices(ticker: str, start: str) -> pd.Series:
+    try:
+        import yfinance as yf
+    except ImportError as exc:
+        raise RuntimeError("Install yfinance to download market data: pip install yfinance") from exc
+    data = yf.download(ticker, start=start, auto_adjust=True, progress=False)
+    if data.empty:
+        raise ValueError(f"No price data returned for {ticker!r} from {start}")
+    close = data["Close"]
+    if isinstance(close, pd.DataFrame):
+        close = close.iloc[:, 0]
+    close = close.dropna().astype(float).sort_index()
+    close = close[~close.index.duplicated(keep="last")]
+    close.name = ticker
+    return close
 
 
-def walk_forward(prices, strategy, param_grid, train_days=756, test_days=126,
-                 cost_bps=5.0):
-    """train_days ~3y, test_days ~6 months (trading days)."""
-    oos_parts, log = [], []
-    start = 0
-    while start + train_days + test_days <= len(prices):
-        train = prices.iloc[start: start + train_days]
-        # include the train tail so indicators are warmed up at the test start
-        warm_test = prices.iloc[start: start + train_days + test_days]
+def synthetic_prices(days: int = 2500, seed: int = 7) -> pd.Series:
+    if days < 2:
+        raise ValueError("days must be at least 2")
+    rng = np.random.default_rng(seed)
+    returns = rng.normal(0.0003, 0.012, days)
+    return pd.Series(100 * np.cumprod(1 + returns),
+                     index=pd.bdate_range("2010-01-01", periods=days), name="price")
 
-        params, in_sharpe = optimize(train, strategy, param_grid, cost_bps)
-        res = backtest(warm_test, strategy, cost_bps=cost_bps, **params)
-        test_res = res.iloc[train_days:]  # only the unseen part
 
-        oos_parts.append(test_res)
-        log.append({
-            "test_start": test_res.index[0].date(),
-            "test_end": test_res.index[-1].date(),
-            **params,
-            "train_sharpe": round(in_sharpe, 2),
-            "test_sharpe": round(sharpe(test_res["strat_ret"]), 2),
-        })
-        start += test_days
+def max_drawdown(returns: pd.Series) -> float:
+    if (returns.empty or not np.isfinite(returns.to_numpy(dtype=float)).all()
+            or (returns < -1).any()):
+        raise ValueError("returns must be non-empty, finite, and no less than -100%")
+    equity = (1 + returns).cumprod()
+    peaks = equity.cummax().clip(lower=1.0)
+    return float((equity / peaks - 1).min())
 
-    oos = pd.concat(oos_parts)
-    oos["equity"] = (1 + oos["strat_ret"]).cumprod()
-    oos["buy_hold"] = (1 + oos["asset_ret"]).cumprod()
-    return oos, pd.DataFrame(log)
+
+def summarize(results: pd.DataFrame, periods: int = 252) -> dict[str, float]:
+    if results.empty or "strat_ret" not in results or "asset_ret" not in results:
+        raise ValueError("results must contain strat_ret and asset_ret columns")
+    if periods <= 0:
+        raise ValueError("periods must be positive")
+    returns = results["strat_ret"]
+    if (not np.isfinite(returns.to_numpy(dtype=float)).all()
+            or (returns < -1).any()):
+        raise ValueError("strategy returns must be finite and no less than -100%")
+    equity = (1 + returns).cumprod()
+    volatility = returns.std(ddof=1)
+    sharpe = np.nan if not np.isfinite(volatility) or volatility == 0 else (
+        returns.mean() / volatility * np.sqrt(periods)
+    )
+    ending_equity = float(equity.iloc[-1])
+    annualized_return = (ending_equity ** (periods / len(returns)) - 1
+                         if ending_equity >= 0 else np.nan)
+    downside = returns.clip(upper=0).pow(2).mean() ** 0.5
+    return {
+        "total_return": ending_equity - 1,
+        "annualized_return": float(annualized_return),
+        "annualized_volatility": float(volatility * np.sqrt(periods)),
+        "sharpe": float(sharpe),
+        "sortino": float(np.nan if downside == 0 else returns.mean() / downside * np.sqrt(periods)),
+        "max_drawdown": max_drawdown(returns),
+        "market_exposure": float((results.get("position", returns * 0 + 1)).mean()),
+        "buy_hold_return": float((1 + results["asset_ret"]).prod() - 1),
+    }
+
+
+def plot(results: pd.DataFrame, title: str = "Backtest") -> None:
+    import matplotlib.pyplot as plt
+
+    ax = results[["equity"]].plot(figsize=(11, 5), title=title)
+    buy_hold = (1 + results["asset_ret"]).cumprod()
+    buy_hold.plot(ax=ax, label="Buy and hold", alpha=0.75)
+    ax.set_ylabel("Growth of $1")
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--ticker", default="AAPL")
-    ap.add_argument("--start", default="2010-01-01")
-    ap.add_argument("--cost-bps", type=float, default=5.0)
-    ap.add_argument("--train-days", type=int, default=756)
-    ap.add_argument("--test-days", type=int, default=126)
-    ap.add_argument("--synthetic", action="store_true")
-    ap.add_argument("--no-plot", action="store_true")
-    a = ap.parse_args()
+    import argparse
 
-    prices = synthetic_prices(2500) if a.synthetic else load_prices(a.ticker, a.start)
-    oos, log = walk_forward(prices, sma_crossover, PARAM_GRID,
-                            a.train_days, a.test_days, a.cost_bps)
-
-    print("\n=== Window log ===")
-    print(log.to_string(index=False))
-    print("\n=== Out-of-sample summary ===")
-    for k, v in summarize(oos).items():
-        print(f"{k:<20} {v}")
-    print(f"\nAvg train Sharpe: {log['train_sharpe'].mean():.2f} | "
-          f"Avg test Sharpe: {log['test_sharpe'].mean():.2f}")
-    print("A big gap between those two numbers is the signature of overfitting.")
-
-    if not a.no_plot:
-        from backtester import plot
-        plot(oos, f"{a.ticker} walk-forward (out-of-sample only)")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--ticker", default="AAPL")
+    parser.add_argument("--start", default="2010-01-01")
+    parser.add_argument("--cost-bps", type=float, default=5.0)
+    parser.add_argument("--synthetic", action="store_true")
+    parser.add_argument("--no-plot", action="store_true")
+    args = parser.parse_args()
+    prices = synthetic_prices() if args.synthetic else load_prices(args.ticker, args.start)
+    results = backtest(prices, cost_bps=args.cost_bps)
+    for key, value in summarize(results).items():
+        print(f"{key:<24} {value:.4f}")
+    if not args.no_plot:
+        plot(results, f"{args.ticker} SMA crossover") 
